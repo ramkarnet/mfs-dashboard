@@ -1,21 +1,15 @@
 # app.py
 # RAMKAR MFS v2.3 - Streamlit Dashboard
-# Tek tuş: veri çek -> hesapla -> dashboard
+# Manuel veri girişli versiyon
 
 import math
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Dict, List, Tuple, Optional
+from datetime import datetime
+from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
 import streamlit as st
-
-# Optional dependencies
-try:
-    import yfinance as yf
-except Exception:
-    yf = None
 
 try:
     import plotly.graph_objects as go
@@ -29,47 +23,27 @@ except Exception:
 st.set_page_config(
     page_title="RAMKAR MFS v2.3 Dashboard",
     layout="wide",
+    initial_sidebar_state="expanded"
 )
 
 APP_VERSION = "v2.3"
-TZ = "Europe/Istanbul"
-
-TICKERS = {
-    "USDTRY": "USDTRY=X",
-    "VIX": "^VIX",
-    "SP500": "^GSPC",
-    "XU100": "XU100.IS",
-    "XBANK": "XBANK.IS",
-}
 
 # Thresholds
 TH = {
-    "K1_USDTRY_SHOCK": 0.05,       # weekly %5
-    "K2_CDS_SPIKE": 100.0,         # +100bp weekly
-    "K2_CDS_LEVEL": 700.0,         # 700bp level
+    "K1_USDTRY_SHOCK": 0.05,
+    "K2_CDS_SPIKE": 100.0,
+    "K2_CDS_LEVEL": 700.0,
     "K3_VIX": 35.0,
-    "K3_SP500": -0.03,             # -%3 weekly
-    "K4_XBANK_DROP": -0.05,        # -%5 weekly
-    "K4_XU100_STABLE": -0.01,      # XU100 > -%1 means "stable"
-    "K5_VOLUME_RATIO": 0.5,        # <0.5 = low liquidity
+    "K3_SP500": -0.03,
+    "K4_XBANK_DROP": -0.05,
+    "K4_XU100_STABLE": -0.01,
+    "K5_VOLUME_RATIO": 0.5,
 }
 
-# Soft veto budget reductions
-BUDGET_REDUCTIONS = {
-    "K4": 0.25,  # 25%
-    "K5": 0.15,  # 15%
-}
+BUDGET_REDUCTIONS = {"K4": 0.25, "K5": 0.15}
 
-# Weights
-W = {
-    "doviz": 0.30,
-    "cds": 0.25,
-    "global": 0.25,
-    "faiz": 0.15,
-    "likidite": 0.05,
-}
+W = {"doviz": 0.30, "cds": 0.25, "global": 0.25, "faiz": 0.15, "likidite": 0.05}
 
-# Risk budget by regime
 BASE_BUDGETS = {
     "ON": (12, 2.5, "✅ NORMAL"),
     "NEUTRAL": (7, 1.5, "✅ SEÇİCİ"),
@@ -78,40 +52,12 @@ BASE_BUDGETS = {
 }
 
 STATE_ICON = {"ON": "🟢", "NEUTRAL": "🟡", "OFF": "🔴", "OFF-KILL": "💀"}
-
-
-# -----------------------------
-# DATA MODEL
-# -----------------------------
-@dataclass
-class MarketSnapshot:
-    asof: datetime
-    usdtry_close: float
-    usdtry_wchg: float
-
-    vix_last: float
-
-    sp500_wchg: float
-
-    xu100_wchg: float
-    xbank_wchg: float
-
-    cds_level: float
-    cds_wdelta: float
-    cds_is_provisional: bool
-
-    volume_ratio: float
-    faiz_proxy: float  # fixed score placeholder
+STATE_COLOR = {"ON": "green", "NEUTRAL": "orange", "OFF": "red", "OFF-KILL": "purple"}
 
 
 # -----------------------------
 # HELPERS
 # -----------------------------
-def safe_pct_change(last: float, prev: float) -> float:
-    if prev is None or prev == 0 or np.isnan(prev):
-        return np.nan
-    return (last - prev) / prev
-
 def bar10(score: int) -> str:
     score = int(max(0, min(100, score)))
     filled = score // 10
@@ -120,58 +66,9 @@ def bar10(score: int) -> str:
 def clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
-def to_float(x, default=np.nan):
-    try:
-        return float(x)
-    except Exception:
-        return default
-
-
-@st.cache_data(ttl=60 * 30, show_spinner=False)
-def fetch_weekly_ohlc(ticker: str, weeks: int = 12) -> Optional[pd.DataFrame]:
-    """
-    Pull weekly bars. Needs internet + yfinance.
-    """
-    if yf is None:
-        return None
-    try:
-        df = yf.download(ticker, period=f"{max(weeks, 4)}wk", interval="1wk", progress=False, auto_adjust=False)
-        if df is None or df.empty:
-            return None
-        df = df.dropna(subset=["Close"])
-        return df
-    except Exception:
-        return None
-
-@st.cache_data(ttl=60 * 30, show_spinner=False)
-def fetch_daily_last(ticker: str, days: int = 10) -> Optional[pd.DataFrame]:
-    if yf is None:
-        return None
-    try:
-        df = yf.download(ticker, period=f"{max(days, 5)}d", interval="1d", progress=False, auto_adjust=False)
-        if df is None or df.empty:
-            return None
-        df = df.dropna(subset=["Close"])
-        return df
-    except Exception:
-        return None
-
-
-def compute_weekly_change_from_df(df: pd.DataFrame) -> Tuple[float, float]:
-    """
-    Returns: (last_close, weekly_change) using last 2 weekly closes.
-    """
-    if df is None or df.empty or len(df) < 2:
-        return (np.nan, np.nan)
-    last = float(df["Close"].iloc[-1])
-    prev = float(df["Close"].iloc[-2])
-    return last, safe_pct_change(last, prev)
-
 
 def score_doviz(usdtry_wchg: float) -> Tuple[int, str]:
     c = abs(usdtry_wchg)
-    if np.isnan(c):
-        return 60, "⚠️ Veri yok"
     if c < 0.005:
         return 100, "✅ Güvenli"
     if c < 0.015:
@@ -182,513 +79,344 @@ def score_doviz(usdtry_wchg: float) -> Tuple[int, str]:
         return 10, "🔴 Tehlike"
     return 0, "💀 Şok"
 
+
 def score_cds(cds_level: float, cds_wdelta: float) -> Tuple[int, str]:
-    lvl = cds_level
-    if np.isnan(lvl) or lvl <= 0:
-        return 50, "⚠️ Veri yok"
-    if lvl < 300:
-        base = 100
-        status = "✅ Güvenli"
-    elif lvl < 400:
-        base = 70
-        status = "⚠️ Normal"
-    elif lvl < 500:
-        base = 50
-        status = "🟠 Dikkat"
-    elif lvl < 600:
-        base = 30
-        status = "🔴 Riskli"
-    elif lvl < 700:
-        base = 10
-        status = "💀 Kriz"
+    if cds_level < 300:
+        base, status = 100, "✅ Güvenli"
+    elif cds_level < 400:
+        base, status = 70, "⚠️ Normal"
+    elif cds_level < 500:
+        base, status = 50, "🟠 Dikkat"
+    elif cds_level < 600:
+        base, status = 30, "🔴 Riskli"
+    elif cds_level < 700:
+        base, status = 10, "💀 Kriz"
     else:
-        base = 0
-        status = "💀 Çöküş"
-
-    # weekly delta penalty
-    if not np.isnan(cds_wdelta) and cds_wdelta > 50:
+        base, status = 0, "💀 Çöküş"
+    
+    if cds_wdelta > 50:
         base = max(0, base - 20)
-
     return base, status
 
+
 def score_global(vix_last: float, sp500_wchg: float) -> Tuple[int, str]:
-    v = vix_last
-    if np.isnan(v):
-        base, status = 60, "⚠️ Veri yok"
-    elif v < 20:
+    if vix_last < 20:
         base, status = 100, "✅ Sakin"
-    elif v < 25:
+    elif vix_last < 25:
         base, status = 80, "✅ Normal"
-    elif v < 30:
+    elif vix_last < 30:
         base, status = 60, "⚠️ Gergin"
-    elif v < 35:
+    elif vix_last < 35:
         base, status = 40, "🟠 Alarm"
     else:
         base, status = 20, "🔴 Panik"
-
-    # equity drawdown penalty
-    if not np.isnan(sp500_wchg):
-        if sp500_wchg < -0.02:
-            base = max(0, base - 20)
-        elif sp500_wchg < -0.01:
-            base = max(0, base - 10)
-
+    
+    if sp500_wchg < -0.02:
+        base = max(0, base - 20)
+    elif sp500_wchg < -0.01:
+        base = max(0, base - 10)
     return base, status
 
+
 def score_likidite(volume_ratio: float) -> Tuple[int, str]:
-    vr = volume_ratio
-    if np.isnan(vr) or vr <= 0:
-        return 40, "⚠️ Veri yok"
-    if vr >= 1.2:
+    if volume_ratio >= 1.2:
         return 100, "✅ Yüksek"
-    if vr >= 0.8:
+    if volume_ratio >= 0.8:
         return 70, "✅ Normal"
-    if vr >= 0.5:
+    if volume_ratio >= 0.5:
         return 40, "⚠️ Düşük"
     return 10, "🔴 Kritik"
 
 
-def kill_switch_checks(snap: MarketSnapshot) -> Dict[str, bool]:
-    # True means OK / pass
-    k1_ok = (not np.isnan(snap.usdtry_wchg)) and (snap.usdtry_wchg < TH["K1_USDTRY_SHOCK"])
-    # CDS kill: either spike or level
-    k2_ok = (snap.cds_level < TH["K2_CDS_LEVEL"]) and (snap.cds_wdelta < TH["K2_CDS_SPIKE"])
-    # Global kill: VIX > 35 AND SP500 <= -3%
-    k3_ok = not ((snap.vix_last > TH["K3_VIX"]) and (snap.sp500_wchg <= TH["K3_SP500"]))
+# -----------------------------
+# UI - SIDEBAR
+# -----------------------------
+st.sidebar.title("📊 Veri Girişi")
+st.sidebar.caption("Verileri gir, sonucu gör!")
 
-    # Soft veto checks
-    k4_ok = not ((snap.xbank_wchg <= TH["K4_XBANK_DROP"]) and (snap.xu100_wchg > TH["K4_XU100_STABLE"]))
-    k5_ok = snap.volume_ratio >= TH["K5_VOLUME_RATIO"]
+st.sidebar.markdown("---")
+st.sidebar.subheader("💵 Döviz")
+usdtry_price = st.sidebar.number_input("USDTRY Fiyat", value=35.30, step=0.10, format="%.2f")
+usdtry_wchg_pct = st.sidebar.number_input("USDTRY Haftalık % Değişim", value=0.8, step=0.1, format="%.2f")
+usdtry_wchg = usdtry_wchg_pct / 100
 
-    return {"K1": k1_ok, "K2": k2_ok, "K3": k3_ok, "K4": k4_ok, "K5": k5_ok}
+st.sidebar.markdown("---")
+st.sidebar.subheader("📈 CDS")
+cds_level = st.sidebar.number_input("CDS Seviyesi (bp)", value=204.0, step=5.0, format="%.1f")
+cds_wdelta = st.sidebar.number_input("CDS Haftalık Δ (bp)", value=0.0, step=5.0, format="%.1f")
 
+st.sidebar.markdown("---")
+st.sidebar.subheader("🌍 Küresel")
+vix_last = st.sidebar.number_input("VIX", value=17.5, step=0.5, format="%.1f")
+sp500_wchg_pct = st.sidebar.number_input("S&P500 Haftalık %", value=1.0, step=0.5, format="%.2f")
+sp500_wchg = sp500_wchg_pct / 100
 
-def compute_soft_veto_reduction(checks: Dict[str, bool]) -> Tuple[float, List[str]]:
-    reduction = 0.0
-    reasons = []
-    if not checks["K4"]:
-        reduction += BUDGET_REDUCTIONS["K4"]
-        reasons.append("K4: Banka ayrışması (XBANK çöküyor, XU100 stabil)")
-    if not checks["K5"]:
-        reduction += BUDGET_REDUCTIONS["K5"]
-        reasons.append("K5: Likidite düşük (hacim oranı < 0.5)")
-    reduction = clamp(reduction, 0.0, 0.5)
-    return reduction, reasons
+st.sidebar.markdown("---")
+st.sidebar.subheader("🏦 BIST")
+xu100_wchg_pct = st.sidebar.number_input("XU100 Haftalık %", value=2.0, step=0.5, format="%.2f")
+xu100_wchg = xu100_wchg_pct / 100
+xbank_wchg_pct = st.sidebar.number_input("XBANK Haftalık %", value=2.5, step=0.5, format="%.2f")
+xbank_wchg = xbank_wchg_pct / 100
 
+st.sidebar.markdown("---")
+st.sidebar.subheader("💧 Likidite")
+volume_ratio = st.sidebar.number_input("Hacim Oranı (1.0 = normal)", value=1.0, step=0.1, format="%.1f")
 
-def compute_total_score(scores: Dict[str, int]) -> int:
-    total = (
-        scores["doviz"] * W["doviz"]
-        + scores["cds"] * W["cds"]
-        + scores["global"] * W["global"]
-        + scores["faiz"] * W["faiz"]
-        + scores["likidite"] * W["likidite"]
-    )
-    return int(round(total))
+st.sidebar.markdown("---")
+st.sidebar.subheader("🏛️ Faiz")
+faiz_score = st.sidebar.slider("Faiz Skoru (proxy)", 0, 100, 60)
 
-
-def determine_regime(hard_kill: bool, total_score: int) -> str:
-    if hard_kill:
-        return "OFF-KILL"
-    if total_score >= 60:
-        return "ON"
-    if total_score >= 40:
-        return "NEUTRAL"
-    return "OFF"
-
-
-def adjusted_budget(regime: str, soft_reduction: float) -> Tuple[Tuple[int, float, str], Tuple[int, float, str]]:
-    base = BASE_BUDGETS[regime]
-    if soft_reduction <= 0:
-        return base, base
-    max_pos, max_risk, new_entry = base
-    factor = 1.0 - soft_reduction
-    adj_pos = max(2, int(math.floor(max_pos * factor)))
-    adj_risk = round(max_risk * factor, 1)
-    adj_entry = new_entry if soft_reduction < 0.3 else "⚠️ DİKKATLİ"
-    return (adj_pos, adj_risk, adj_entry), base
-
-
-def top_risks(snap: MarketSnapshot) -> List[Dict[str, str]]:
-    # distance to alarm thresholds
-    # smaller distance = closer to risk
-    risks = []
-
-    # VIX alarm threshold 25
-    vix_dist = 0 if snap.vix_last >= 25 else (25 - snap.vix_last) / 25 * 100
-    risks.append({
-        "name": "VIX",
-        "value": f"{snap.vix_last:.2f}" if not np.isnan(snap.vix_last) else "NA",
-        "threshold": "25 (alarm)",
-        "distance": f"{max(0, vix_dist):.0f}%",
-        "distance_num": float(max(0, vix_dist)),
-    })
-
-    # USDTRY alarm threshold 1.5%
-    u = abs(snap.usdtry_wchg) if not np.isnan(snap.usdtry_wchg) else np.nan
-    usd_dist = 0 if (np.isnan(u) or u >= 0.015) else (0.015 - u) / 0.015 * 100
-    risks.append({
-        "name": "USDTRY",
-        "value": f"%{snap.usdtry_wchg*100:+.2f}" if not np.isnan(snap.usdtry_wchg) else "NA",
-        "threshold": "%1.5 (alarm)",
-        "distance": f"{max(0, usd_dist):.0f}%" if not np.isnan(usd_dist) else "NA",
-        "distance_num": float(max(0, usd_dist)) if not np.isnan(usd_dist) else 9999.0,
-    })
-
-    # CDS alarm threshold 400
-    c = snap.cds_level
-    cds_dist = 0 if c >= 400 else (400 - c) / 400 * 100
-    risks.append({
-        "name": "CDS",
-        "value": f"{c:.2f} bp" if not np.isnan(c) else "NA",
-        "threshold": "400 bp (alarm)",
-        "distance": f"{max(0, cds_dist):.0f}%",
-        "distance_num": float(max(0, cds_dist)),
-    })
-
-    risks.sort(key=lambda x: x["distance_num"])
-    return [{k: v for k, v in r.items() if k != "distance_num"} for r in risks[:2]]
-
-
-def confidence_level(snap: MarketSnapshot) -> Tuple[str, List[str]]:
-    reasons = []
-    penalty = 0
-
-    if snap.cds_is_provisional:
-        reasons.append("CDS verisi PROVISIONAL (manuel girildi)")
-        penalty += 1
-
-    if np.isnan(snap.usdtry_wchg) or np.isnan(snap.vix_last) or np.isnan(snap.sp500_wchg):
-        reasons.append("Bazı otomatik veriler eksik (yfinance / internet / ticker sorunu)")
-        penalty += 2
-
-    # faiz proxy always provisional by design
-    reasons.append("Faiz modülü PROXY (TCMB entegrasyonu yok)")
-    penalty += 1
-
-    if penalty <= 1:
-        return "HIGH", reasons
-    if penalty <= 3:
-        return "MEDIUM", reasons
-    return "LOW", reasons
-
-
-def plot_series(df: pd.DataFrame, title: str) -> Optional[object]:
-    if go is None or df is None or df.empty:
-        return None
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=df.index, y=df["Close"], mode="lines", name="Close"))
-    fig.update_layout(
-        title=title,
-        height=260,
-        margin=dict(l=10, r=10, t=40, b=10),
-        xaxis_title="",
-        yaxis_title="",
-    )
-    return fig
+st.sidebar.markdown("---")
+st.sidebar.caption("📅 Veri kaynakları:")
+st.sidebar.caption("• investing.com/tr")
+st.sidebar.caption("• worldgovernmentbonds.com")
+st.sidebar.caption("• tradingview.com")
 
 
 # -----------------------------
-# UI - HEADER
+# CALCULATIONS
 # -----------------------------
-st.title(f"🎯 RAMKAR MFS {APP_VERSION} — Makro Risk Dashboard")
-st.caption("Tek amaç: Makro ortam 'risk al' mı 'risk kıs' mı? RAMKAR sinyalinden bağımsız filtre.")
+# Kill-Switch Checks
+k1_ok = usdtry_wchg < TH["K1_USDTRY_SHOCK"]
+k2_ok = (cds_level < TH["K2_CDS_LEVEL"]) and (cds_wdelta < TH["K2_CDS_SPIKE"])
+k3_ok = not ((vix_last > TH["K3_VIX"]) and (sp500_wchg <= TH["K3_SP500"]))
+k4_ok = not ((xbank_wchg <= TH["K4_XBANK_DROP"]) and (xu100_wchg > TH["K4_XU100_STABLE"]))
+k5_ok = volume_ratio >= TH["K5_VOLUME_RATIO"]
 
-with st.sidebar:
-    st.subheader("Kontrol Paneli")
-    st.write("Çalıştır dediğinde verileri çeker (internet gerekebilir), CDS'i sen girersin.")
-    run_btn = st.button("▶ ÇALIŞTIR / GÜNCELLE", use_container_width=True)
+checks = {"K1": k1_ok, "K2": k2_ok, "K3": k3_ok, "K4": k4_ok, "K5": k5_ok}
+hard_kill = (not k1_ok) or (not k2_ok) or (not k3_ok)
 
-    st.divider()
-    st.markdown("### CDS (manuel)")
-    cds_level = st.number_input("CDS (bp)", min_value=0.0, value=203.98, step=1.0)
-    cds_wdelta = st.number_input("CDS haftalık değişim (bp)", value=0.0, step=1.0)
-    cds_prov = st.toggle("CDS PROVISIONAL", value=True)
+# Soft Veto
+soft_reduction = 0.0
+soft_reasons = []
+if not k4_ok:
+    soft_reduction += BUDGET_REDUCTIONS["K4"]
+    soft_reasons.append("K4: Banka ayrışması")
+if not k5_ok:
+    soft_reduction += BUDGET_REDUCTIONS["K5"]
+    soft_reasons.append("K5: Düşük likidite")
+soft_reduction = clamp(soft_reduction, 0.0, 0.5)
 
-    st.divider()
-    st.markdown("### Likidite (manuel)")
-    volume_ratio = st.number_input("BIST hacim oranı (1.0 = normal)", min_value=0.0, value=1.0, step=0.1)
-
-    st.divider()
-    st.markdown("### Faiz (şimdilik proxy)")
-    faiz_score = st.slider("Faiz skoru (proxy)", min_value=0, max_value=100, value=60, step=1)
-
-    st.divider()
-    st.markdown("### Veri Kaynağı")
-    st.write("- Otomatik: yfinance (USDTRY, VIX, S&P500, XU100, XBANK)")
-    st.write("- Manuel: CDS, Hacim oranı")
-    st.write("- Not: CDS otomasyonu stabil kaynak ister; sonra ekleriz.")
-
-
-# -----------------------------
-# DATA LOAD
-# -----------------------------
-if "last_snapshot" not in st.session_state:
-    st.session_state["last_snapshot"] = None
-if "score_history" not in st.session_state:
-    st.session_state["score_history"] = []
-
-def build_snapshot() -> Tuple[MarketSnapshot, Dict[str, Optional[pd.DataFrame]]]:
-    now = datetime.now()
-
-    weekly = {}
-    daily = {}
-
-    if yf is not None:
-        weekly["USDTRY"] = fetch_weekly_ohlc(TICKERS["USDTRY"], weeks=12)
-        weekly["SP500"] = fetch_weekly_ohlc(TICKERS["SP500"], weeks=12)
-        weekly["XU100"] = fetch_weekly_ohlc(TICKERS["XU100"], weeks=12)
-        weekly["XBANK"] = fetch_weekly_ohlc(TICKERS["XBANK"], weeks=12)
-        daily["VIX"] = fetch_daily_last(TICKERS["VIX"], days=10)
-    else:
-        weekly = {k: None for k in ["USDTRY", "SP500", "XU100", "XBANK"]}
-        daily = {"VIX": None}
-
-    usdtry_close, usdtry_wchg = compute_weekly_change_from_df(weekly["USDTRY"])
-    _, sp500_wchg = compute_weekly_change_from_df(weekly["SP500"])
-    _, xu100_wchg = compute_weekly_change_from_df(weekly["XU100"])
-    _, xbank_wchg = compute_weekly_change_from_df(weekly["XBANK"])
-
-    vix_last = np.nan
-    if daily["VIX"] is not None and not daily["VIX"].empty:
-        vix_last = float(daily["VIX"]["Close"].iloc[-1])
-
-    snap = MarketSnapshot(
-        asof=now,
-        usdtry_close=to_float(usdtry_close),
-        usdtry_wchg=to_float(usdtry_wchg),
-
-        vix_last=to_float(vix_last),
-
-        sp500_wchg=to_float(sp500_wchg),
-
-        xu100_wchg=to_float(xu100_wchg),
-        xbank_wchg=to_float(xbank_wchg),
-
-        cds_level=float(cds_level),
-        cds_wdelta=float(cds_wdelta),
-        cds_is_provisional=bool(cds_prov),
-
-        volume_ratio=float(volume_ratio),
-        faiz_proxy=float(faiz_score),
-    )
-
-    raw = {
-        "USDTRY_weekly": weekly["USDTRY"],
-        "SP500_weekly": weekly["SP500"],
-        "XU100_weekly": weekly["XU100"],
-        "XBANK_weekly": weekly["XBANK"],
-        "VIX_daily": daily["VIX"],
-    }
-    return snap, raw
-
-
-if run_btn or st.session_state["last_snapshot"] is None:
-    with st.spinner("Veriler alınıyor ve hesaplanıyor..."):
-        snap, raw = build_snapshot()
-        st.session_state["last_snapshot"] = (snap, raw)
-else:
-    snap, raw = st.session_state["last_snapshot"]
-
-
-# -----------------------------
-# CORE CALC
-# -----------------------------
-checks = kill_switch_checks(snap)
-hard_kill = (not checks["K1"]) or (not checks["K2"]) or (not checks["K3"])
-soft_reduction, soft_reasons = compute_soft_veto_reduction(checks)
-
-doviz_score, doviz_status = score_doviz(snap.usdtry_wchg)
-cds_score, cds_status = score_cds(snap.cds_level, snap.cds_wdelta)
-glob_score, glob_status = score_global(snap.vix_last, snap.sp500_wchg)
-lik_score, lik_status = score_likidite(snap.volume_ratio)
-faiz_score_fixed = int(clamp(snap.faiz_proxy, 0, 100))
+# Factor Scores
+doviz_score, doviz_status = score_doviz(usdtry_wchg)
+cds_score, cds_status = score_cds(cds_level, cds_wdelta)
+glob_score, glob_status = score_global(vix_last, sp500_wchg)
+lik_score, lik_status = score_likidite(volume_ratio)
 
 scores = {
-    "doviz": int(doviz_score),
-    "cds": int(cds_score),
-    "global": int(glob_score),
-    "faiz": int(faiz_score_fixed),
-    "likidite": int(lik_score),
+    "doviz": doviz_score,
+    "cds": cds_score,
+    "global": glob_score,
+    "faiz": faiz_score,
+    "likidite": lik_score,
 }
 
-total = compute_total_score(scores)
-regime = determine_regime(hard_kill, total)
+total = int(round(
+    scores["doviz"] * W["doviz"] +
+    scores["cds"] * W["cds"] +
+    scores["global"] * W["global"] +
+    scores["faiz"] * W["faiz"] +
+    scores["likidite"] * W["likidite"]
+))
 
-(adj_pos, adj_risk, adj_entry), (base_pos, base_risk, base_entry) = adjusted_budget(regime, soft_reduction)
-top2 = top_risks(snap)
-conf, conf_reasons = confidence_level(snap)
+# Regime
+if hard_kill:
+    regime = "OFF-KILL"
+elif total >= 60:
+    regime = "ON"
+elif total >= 40:
+    regime = "NEUTRAL"
+else:
+    regime = "OFF"
 
-# trajectory history
-hist = st.session_state["score_history"]
-hist.append({"asof": snap.asof, "total": total})
-hist = hist[-12:]  # keep last 12
-st.session_state["score_history"] = hist
-
-def trajectory_deltas(history: List[Dict]) -> Tuple[float, float, str]:
-    if len(history) < 2:
-        return 0.0, 0.0, "→ Stabil"
-    d1 = history[-1]["total"] - history[-2]["total"]
-    d4 = d1
-    if len(history) >= 4:
-        d4 = history[-1]["total"] - history[-4]["total"]
-    if d1 > 3:
-        trend = "↑ İyileşiyor"
-    elif d1 < -3:
-        trend = "↓ Kötüleşiyor"
-    else:
-        trend = "→ Stabil"
-    return float(d1), float(d4), trend
-
-d1, d4, trend = trajectory_deltas(hist)
+# Budget
+base_pos, base_risk, base_entry = BASE_BUDGETS[regime]
+if soft_reduction > 0:
+    adj_pos = max(2, int(math.floor(base_pos * (1 - soft_reduction))))
+    adj_risk = round(base_risk * (1 - soft_reduction), 1)
+    adj_entry = "⚠️ DİKKATLİ" if soft_reduction >= 0.3 else base_entry
+else:
+    adj_pos, adj_risk, adj_entry = base_pos, base_risk, base_entry
 
 
 # -----------------------------
-# UI - KPI ROW
+# UI - MAIN
 # -----------------------------
-c1, c2, c3, c4, c5 = st.columns(5)
+st.title(f"🎯 RAMKAR MFS {APP_VERSION} — Makro Risk Dashboard")
+st.caption("Makro ortam 'risk al' mı 'risk kıs' mı? Tek bakışta gör!")
+
+# KPI Row
+st.markdown("---")
+c1, c2, c3, c4 = st.columns(4)
+
 with c1:
-    st.metric("RiskState", f"{STATE_ICON[regime]} {regime}")
+    st.markdown(f"""
+    <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); 
+                padding: 20px; border-radius: 15px; text-align: center;
+                border: 2px solid {STATE_COLOR[regime]};">
+        <div style="font-size: 14px; color: #888;">RiskState</div>
+        <div style="font-size: 36px; font-weight: 800;">{STATE_ICON[regime]} {regime}</div>
+    </div>
+    """, unsafe_allow_html=True)
+
 with c2:
-    st.metric("Toplam Skor", f"{total} / 100", delta=f"{d1:+.0f} (1w)")
+    score_color = "#00c853" if total >= 60 else "#ffc107" if total >= 40 else "#ff1744"
+    st.markdown(f"""
+    <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); 
+                padding: 20px; border-radius: 15px; text-align: center;">
+        <div style="font-size: 14px; color: #888;">Toplam Skor</div>
+        <div style="font-size: 36px; font-weight: 800; color: {score_color};">{total} / 100</div>
+    </div>
+    """, unsafe_allow_html=True)
+
 with c3:
-    st.metric("Max Pozisyon", f"{adj_pos}", delta=f"{adj_pos-base_pos:+d}" if soft_reduction > 0 else None)
+    st.markdown(f"""
+    <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); 
+                padding: 20px; border-radius: 15px; text-align: center;">
+        <div style="font-size: 14px; color: #888;">Max Pozisyon</div>
+        <div style="font-size: 36px; font-weight: 800; color: #00d4ff;">{adj_pos}</div>
+    </div>
+    """, unsafe_allow_html=True)
+
 with c4:
-    st.metric("Max Risk", f"{adj_risk}R", delta=f"{adj_risk-base_risk:+.1f}R" if soft_reduction > 0 else None)
-with c5:
-    st.metric("Confidence", conf)
+    st.markdown(f"""
+    <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); 
+                padding: 20px; border-radius: 15px; text-align: center;">
+        <div style="font-size: 14px; color: #888;">Max Risk</div>
+        <div style="font-size: 36px; font-weight: 800; color: #00d4ff;">{adj_risk}R</div>
+    </div>
+    """, unsafe_allow_html=True)
 
-st.divider()
+st.markdown("---")
 
+# Kill-Switch Status
+st.subheader("🚨 Kill-Switch Durumu")
 
-# -----------------------------
-# UI - MAIN LAYOUT
-# -----------------------------
-left, right = st.columns([1.15, 0.85])
+ks_cols = st.columns(5)
+ks_labels = {"K1": "Döviz", "K2": "CDS", "K3": "Küresel", "K4": "Banka", "K5": "Likidite"}
+
+for i, (k, ok) in enumerate(checks.items()):
+    with ks_cols[i]:
+        if ok:
+            st.success(f"**{k}** {ks_labels[k]}\n\n✅ OK")
+        elif k in ["K1", "K2", "K3"]:
+            st.error(f"**{k}** {ks_labels[k]}\n\n❌ KILL")
+        else:
+            st.warning(f"**{k}** {ks_labels[k]}\n\n⚠️ VETO")
+
+if hard_kill:
+    st.error("⛔ **Hard Kill aktif!** Yeni giriş yasak. Rejim: OFF-KILL")
+elif soft_reduction > 0:
+    st.warning(f"⚡ **Soft Veto aktif:** Risk bütçesi -%{int(soft_reduction*100)} | {' | '.join(soft_reasons)}")
+else:
+    st.success("✅ Tüm kontroller normal. Hard kill yok, soft veto yok.")
+
+st.markdown("---")
+
+# Two Columns
+left, right = st.columns([1.2, 0.8])
 
 with left:
-    st.subheader("Kill-Switch / Soft Veto Durumu")
-
-    ks_cols = st.columns(5)
-    for i, k in enumerate(["K1", "K2", "K3", "K4", "K5"]):
-        ok = checks[k]
-        label = {
-            "K1": "K1 Döviz",
-            "K2": "K2 CDS",
-            "K3": "K3 Küresel",
-            "K4": "K4 Banka",
-            "K5": "K5 Likidite",
-        }[k]
-        status = "✅ OK" if ok else ("❌ KILL" if k in ["K1", "K2", "K3"] else "⚠️ SOFT")
-        ks_cols[i].write(f"**{label}**")
-        ks_cols[i].markdown(f"<div style='font-size:22px; font-weight:700'>{status}</div>", unsafe_allow_html=True)
-
-    st.caption(
-        "Not: K1-K2-K3 hard kill (OFF-KILL). K4-K5 soft veto (risk bütçesini düşürür, rejimi öldürmez)."
-    )
-
-    if hard_kill:
-        st.error("Hard Kill aktif: Yeni giriş yasak. Rejim: OFF-KILL.")
-    elif soft_reduction > 0:
-        st.warning(f"Soft veto aktif: Risk bütçesi -%{int(soft_reduction*100)}. Nedenler: " + " | ".join(soft_reasons))
-    else:
-        st.success("Tüm kontroller normal: Hard kill yok, soft veto yok.")
-
-    st.subheader("Faktör Skorları")
+    st.subheader("📈 Faktör Skorları")
+    
     df_scores = pd.DataFrame([
-        {"Faktör": "Döviz (USDTRY)", "Skor": scores["doviz"], "Durum": doviz_status, "Detay": f"%{snap.usdtry_wchg*100:+.2f}" if not np.isnan(snap.usdtry_wchg) else "NA"},
-        {"Faktör": "CDS", "Skor": scores["cds"], "Durum": cds_status + (" (PROV)" if snap.cds_is_provisional else ""), "Detay": f"{snap.cds_level:.2f} bp (Δ{snap.cds_wdelta:+.0f})"},
-        {"Faktör": "Küresel (VIX+S&P)", "Skor": scores["global"], "Durum": glob_status, "Detay": f"VIX {snap.vix_last:.2f}, S&P w/w %{snap.sp500_wchg*100:+.2f}" if not np.isnan(snap.sp500_wchg) else f"VIX {snap.vix_last:.2f}"},
-        {"Faktör": "Faiz", "Skor": scores["faiz"], "Durum": "⚠️ Proxy", "Detay": "TCMB entegrasyonu yok"},
-        {"Faktör": "Likidite", "Skor": scores["likidite"], "Durum": lik_status, "Detay": f"Hacim oranı {snap.volume_ratio:.2f}"},
+        {"Faktör": "💵 Döviz (USDTRY)", "Bar": bar10(doviz_score), "Skor": doviz_score, "Durum": doviz_status, "Detay": f"%{usdtry_wchg*100:+.2f} haftalık"},
+        {"Faktör": "📊 CDS", "Bar": bar10(cds_score), "Skor": cds_score, "Durum": cds_status, "Detay": f"{cds_level:.0f}bp (Δ{cds_wdelta:+.0f})"},
+        {"Faktör": "🌍 Küresel", "Bar": bar10(glob_score), "Skor": glob_score, "Durum": glob_status, "Detay": f"VIX={vix_last:.1f}, S&P={sp500_wchg*100:+.1f}%"},
+        {"Faktör": "🏛️ Faiz", "Bar": bar10(faiz_score), "Skor": faiz_score, "Durum": "⚠️ Proxy", "Detay": "TCMB verisi yok"},
+        {"Faktör": "💧 Likidite", "Bar": bar10(lik_score), "Skor": lik_score, "Durum": lik_status, "Detay": f"Hacim: {volume_ratio:.1f}x"},
     ])
-
-    df_scores["Bar"] = df_scores["Skor"].apply(bar10)
-    df_show = df_scores[["Faktör", "Bar", "Skor", "Durum", "Detay"]]
-    st.dataframe(df_show, use_container_width=True, hide_index=True)
-
-    st.subheader("Skor Trajektorisi")
-    tcol1, tcol2, tcol3 = st.columns(3)
-    tcol1.metric("Δ 1w", f"{d1:+.0f}")
-    tcol2.metric("Δ 4w", f"{d4:+.0f}")
-    tcol3.metric("Trend", trend)
-
-    if go is not None and len(hist) >= 2:
-        hist_df = pd.DataFrame(hist)
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=hist_df["asof"], y=hist_df["total"], mode="lines+markers", name="Total"))
-        fig.update_layout(height=260, margin=dict(l=10, r=10, t=30, b=10), xaxis_title="", yaxis_title="Skor")
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.caption("Grafik için plotly gerekir veya en az 2 veri noktası olmalı.")
+    
+    st.dataframe(df_scores, use_container_width=True, hide_index=True)
+    
+    # Score breakdown
+    st.markdown("**Skor Dağılımı:**")
+    breakdown = f"""
+    | Faktör | Ağırlık | Skor | Katkı |
+    |--------|---------|------|-------|
+    | Döviz | %30 | {doviz_score} | {doviz_score * 0.30:.1f} |
+    | CDS | %25 | {cds_score} | {cds_score * 0.25:.1f} |
+    | Küresel | %25 | {glob_score} | {glob_score * 0.25:.1f} |
+    | Faiz | %15 | {faiz_score} | {faiz_score * 0.15:.1f} |
+    | Likidite | %5 | {lik_score} | {lik_score * 0.05:.1f} |
+    | **TOPLAM** | **%100** | | **{total}** |
+    """
+    st.markdown(breakdown)
 
 with right:
-    st.subheader("Risk Bütçesi ve Aksiyon")
-
-    st.markdown(
-        f"""
-        <div style="padding:14px; border-radius:14px; border:1px solid rgba(0,0,0,0.12);">
-          <div style="font-size:18px; font-weight:700">Haftalık Karar</div>
-          <div style="margin-top:6px; font-size:22px; font-weight:800">{STATE_ICON[regime]} {regime}</div>
-          <div style="margin-top:10px; font-size:14px;">
-            <b>Max Pozisyon:</b> {adj_pos}<br/>
-            <b>Max Toplam Risk:</b> {adj_risk}R<br/>
-            <b>Yeni Giriş:</b> {adj_entry}<br/>
-          </div>
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
-
+    st.subheader("🎯 Haftalık Karar")
+    
     if regime == "ON":
-        st.success("Makro filtre yeşil. RAMKAR teknik sinyal gelirse değerlendirilir.")
+        st.markdown(f"""
+        <div style="background: linear-gradient(135deg, rgba(0,200,83,0.2), rgba(0,230,118,0.1));
+                    padding: 25px; border-radius: 15px; border: 2px solid #00c853;">
+            <div style="font-size: 28px; font-weight: 800; color: #00c853;">🟢 YEŞİL IŞIK</div>
+            <div style="margin-top: 15px; color: #ccc;">
+                • Makro ortam <b>uygun</b><br>
+                • Max <b>{adj_pos}</b> pozisyon açabilirsin<br>
+                • Max <b>{adj_risk}R</b> toplam risk<br>
+                • RAMKAR sinyallerini değerlendir
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
     elif regime == "NEUTRAL":
-        st.warning("Seçici mod: Sadece A kalite, düşük korelasyon, düşük riskli sinyaller.")
+        st.markdown(f"""
+        <div style="background: linear-gradient(135deg, rgba(255,193,7,0.2), rgba(255,202,40,0.1));
+                    padding: 25px; border-radius: 15px; border: 2px solid #ffc107;">
+            <div style="font-size: 28px; font-weight: 800; color: #ffc107;">🟡 DİKKATLİ OL</div>
+            <div style="margin-top: 15px; color: #ccc;">
+                • Makro ortam <b>karışık</b><br>
+                • Max <b>{adj_pos}</b> pozisyon<br>
+                • Max <b>{adj_risk}R</b> risk<br>
+                • Sadece A kalite sinyaller
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
     elif regime == "OFF":
-        st.error("Makro risk yüksek: Çok sınırlı işlem / risk azalt.")
+        st.markdown(f"""
+        <div style="background: linear-gradient(135deg, rgba(255,23,68,0.2), rgba(255,82,82,0.1));
+                    padding: 25px; border-radius: 15px; border: 2px solid #ff1744;">
+            <div style="font-size: 28px; font-weight: 800; color: #ff1744;">🔴 RİSK YÜKSEK</div>
+            <div style="margin-top: 15px; color: #ccc;">
+                • Makro ortam <b>olumsuz</b><br>
+                • Max <b>{adj_pos}</b> pozisyon<br>
+                • Max <b>{adj_risk}R</b> risk<br>
+                • Çok sınırlı işlem
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
     else:
-        st.error("OFF-KILL: Yeni giriş yasak. Koruma modu.")
-
-    st.subheader("Top 2 Risk Sürücüsü")
-    for r in top2:
-        st.write(f"**{r['name']}**: {r['value']}")
-        st.caption(f"Eşik: {r['threshold']} | Mesafe: {r['distance']}")
-
-    st.subheader("Confidence / Data Quality")
-    conf_icon = {"HIGH": "🟢", "MEDIUM": "🟡", "LOW": "🔴"}[conf]
-    st.write(f"**{conf_icon} {conf}**")
-    for rr in conf_reasons[:5]:
-        st.caption(f"• {rr}")
-
-    st.subheader("Veri Özeti (Asof)")
-    st.write(f"**Tarih:** {snap.asof.strftime('%Y-%m-%d %H:%M')}")
-    st.write(f"**USDTRY:** {snap.usdtry_close:.4f} | w/w: %{snap.usdtry_wchg*100:+.2f}" if not np.isnan(snap.usdtry_close) else "**USDTRY:** NA")
-    st.write(f"**VIX:** {snap.vix_last:.2f}" if not np.isnan(snap.vix_last) else "**VIX:** NA")
-    st.write(f"**S&P500 w/w:** %{snap.sp500_wchg*100:+.2f}" if not np.isnan(snap.sp500_wchg) else "**S&P500 w/w:** NA")
-    st.write(f"**XU100 w/w:** %{snap.xu100_wchg*100:+.2f}" if not np.isnan(snap.xu100_wchg) else "**XU100 w/w:** NA")
-    st.write(f"**XBANK w/w:** %{snap.xbank_wchg*100:+.2f}" if not np.isnan(snap.xbank_wchg) else "**XBANK w/w:** NA")
-    st.write(f"**CDS:** {snap.cds_level:.2f} bp | Δ: {snap.cds_wdelta:+.0f} bp")
-
-    st.divider()
-    st.subheader("Mini Grafikler")
-    if go is None:
-        st.caption("Mini grafikler için plotly kurulmalı: pip install plotly")
-    else:
-        g1, g2 = st.columns(2)
-        fig_usd = plot_series(raw.get("USDTRY_weekly"), "USDTRY (Weekly Close)")
-        fig_xu = plot_series(raw.get("XU100_weekly"), "XU100 (Weekly Close)")
-        if fig_usd: g1.plotly_chart(fig_usd, use_container_width=True)
-        if fig_xu:  g2.plotly_chart(fig_xu, use_container_width=True)
-
-        g3, g4 = st.columns(2)
-        fig_vix = plot_series(raw.get("VIX_daily"), "VIX (Daily Close)")
-        fig_xb = plot_series(raw.get("XBANK_weekly"), "XBANK (Weekly Close)")
-        if fig_vix: g3.plotly_chart(fig_vix, use_container_width=True)
-        if fig_xb:  g4.plotly_chart(fig_xb, use_container_width=True)
-
+        st.markdown(f"""
+        <div style="background: linear-gradient(135deg, rgba(136,14,79,0.3), rgba(173,20,87,0.2));
+                    padding: 25px; border-radius: 15px; border: 2px solid #ad1457;">
+            <div style="font-size: 28px; font-weight: 800; color: #e91e63;">💀 SİSTEM KİLİTLİ</div>
+            <div style="margin-top: 15px; color: #ccc;">
+                • <b>YENİ İŞLEM YAPMA!</b><br>
+                • Mevcut pozisyonları koru<br>
+                • Max <b>{adj_pos}</b> poz, <b>{adj_risk}R</b> risk<br>
+                • Piyasa sakinleşene kadar bekle
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    st.markdown("---")
+    
+    st.subheader("📡 Veri Özeti")
+    st.markdown(f"""
+    | Veri | Değer |
+    |------|-------|
+    | USDTRY | {usdtry_price:.2f} ({usdtry_wchg*100:+.2f}%) |
+    | CDS | {cds_level:.0f} bp |
+    | VIX | {vix_last:.1f} |
+    | S&P500 | {sp500_wchg*100:+.2f}% |
+    | XU100 | {xu100_wchg*100:+.2f}% |
+    | XBANK | {xbank_wchg*100:+.2f}% |
+    | Hacim | {volume_ratio:.1f}x |
+    """)
+    
+    st.caption(f"📅 Güncelleme: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
 
 # Footer
-st.divider()
-st.caption(
-    "⚠️ Uyarı: Bu dashboard yatırım tavsiyesi değildir. MFS sadece makro risk filtresidir; işlem kararı RAMKAR sinyali + risk yönetimi ile verilir."
-)
+st.markdown("---")
+st.caption("⚠️ **Uyarı:** Bu dashboard yatırım tavsiyesi değildir. MFS sadece makro risk filtresidir; işlem kararı RAMKAR sinyali + risk yönetimi ile verilir.")
+st.caption("🎯 **RAMKAR MFS v2.3** | *Para kazandırmak değil, para kaybettirmemek için.*")
